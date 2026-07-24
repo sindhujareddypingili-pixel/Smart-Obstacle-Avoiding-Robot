@@ -1,0 +1,851 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ================= WiFi =================
+const char* apSsid     = "ESP32_Car";
+const char* apPassword = "12345678";
+WebServer server(80);
+
+// ================= L298N =================
+#define IN1 14
+#define IN2 27
+#define IN3 26
+#define IN4 25
+#define ENA_PIN 33
+#define ENB_PIN 32
+
+// ================= PWM =================
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+const int CH_A = 0;
+const int CH_B = 1;
+
+// ================= Speed =================
+uint8_t manualSpeed = 230;
+uint8_t autoSpeed   = 200;
+
+// ================= Ultrasonic =================
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+
+// ================= Flags =================
+bool forwardCmd = false;
+bool backCmd    = false;
+bool leftCmd    = false;
+bool rightCmd   = false;
+
+bool obstacleMode = false;
+bool followMode   = false;
+
+// ================= Manual Obstacle Guard =================
+bool manualObstacleGuard = false;
+
+// ================= Manual Obstacle Evade State =================
+// When obstacle guard is ON and forward is pressed and obstacle detected,
+// the car auto-evades: backward → random turn → stops (returns to manual)
+enum ManualEvadeState { MEVADE_NONE, MEVADE_BACKWARD, MEVADE_TURN, MEVADE_DONE };
+ManualEvadeState mevadeState = MEVADE_NONE;
+unsigned long mevadeStart    = 0;
+bool mevadeTurnLeft          = false;
+
+const unsigned long MEVADE_BACK_TIME = 800;   // ms to reverse
+const unsigned long MEVADE_TURN_TIME = 900;   // ms to turn
+
+// ================= Auto Obstacle =================
+enum AutoState { AUTO_IDLE, AUTO_FORWARD, AUTO_BACKWARD, AUTO_TURN };
+AutoState autoState = AUTO_IDLE;
+
+unsigned long autoStateStart = 0;
+bool turnLeftNext = true;
+
+const unsigned long BACK_TIME        = 800;    // increased from 600
+const unsigned long TURN_TIME        = 900;    // increased from 700
+const float         OBSTACLE_DIST_CM = 25.0;   // increased from 20cm → more reaction time
+
+// ================= HTML =================
+const char index_html[] PROGMEM = R"=====(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>ESP32 Robot Car</title>
+<style>
+  :root {
+    --bg: #080c10;
+    --panel: #0d1520;
+    --border: #1a2a3a;
+    --cyan: #00e5ff;
+    --green: #00ff88;
+    --red: #ff3b5c;
+    --yellow: #ffd600;
+    --orange: #ff6d00;
+    --text: #c8d8e8;
+    --dim: #3a5060;
+    --glow-c: 0 0 12px #00e5ff88, 0 0 30px #00e5ff33;
+    --glow-g: 0 0 12px #00ff8888, 0 0 30px #00ff8833;
+    --glow-r: 0 0 12px #ff3b5c88, 0 0 30px #ff3b5c33;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Courier New', Courier, monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0; z-index: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.04) 1px, transparent 1px);
+    background-size: 40px 40px;
+    animation: gridMove 20s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes gridMove { 0%{background-position:0 0} 100%{background-position:40px 40px} }
+
+  .container {
+    position: relative; z-index: 1;
+    max-width: 520px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+
+  .header { text-align: center; padding: 16px 0 10px; }
+  .header h1 {
+    font-size: 2rem; font-weight: 900; letter-spacing: 6px;
+    color: var(--cyan); text-shadow: var(--glow-c);
+    animation: pulse 3s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.75} }
+  .header .subtitle { font-size: 0.65rem; letter-spacing: 5px; color: var(--dim); margin-top: 4px; }
+
+  .status-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; margin: 10px 0; font-size: 0.68rem;
+  }
+  .status-item { display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); animation: blink 1.5s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  #dist-display { color: var(--cyan); font-weight: bold; }
+
+  /* 3 tabs now — no voice */
+  .mode-tabs {
+    display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; margin-bottom: 12px;
+  }
+  .mode-tab {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 4px; text-align: center;
+    cursor: pointer; transition: all 0.2s;
+    font-size: 0.6rem; letter-spacing: 1px; color: var(--dim);
+  }
+  .mode-tab .ti { font-size: 1.3rem; display: block; margin-bottom: 4px; }
+  .mode-tab.active-manual { border-color:var(--green); color:var(--green); box-shadow:var(--glow-g); background:#001a0d; }
+  .mode-tab.active-auto   { border-color:var(--cyan);  color:var(--cyan);  box-shadow:var(--glow-c); background:#001520; }
+  .mode-tab.active-follow { border-color:var(--orange);color:var(--orange);box-shadow:0 0 12px #ff6d0088;background:#1a0800; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px; display: none;
+    animation: fadeIn 0.3s ease;
+  }
+  .panel.visible { display: block; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  .panel-title {
+    font-size: 0.68rem; letter-spacing: 3px; color: var(--dim);
+    margin-bottom: 14px; text-align: center;
+  }
+
+  /* EVADE ALERT BANNER */
+  .evade-banner {
+    display: none;
+    background: #2a0a00; border: 1px solid var(--orange);
+    border-radius: 8px; padding: 8px 14px; margin-bottom: 12px;
+    font-size: 0.72rem; color: var(--orange); text-align: center;
+    letter-spacing: 2px; animation: flashBorder 0.6s infinite;
+  }
+  .evade-banner.show { display: block; }
+  @keyframes flashBorder {
+    0%,100% { border-color: var(--orange); }
+    50%     { border-color: var(--red);    }
+  }
+
+  /* D-PAD */
+  .dpad-wrap { display:flex; flex-direction:column; align-items:center; gap:6px; margin:10px 0 14px; }
+  .dpad-row  { display:flex; gap:6px; align-items:center; }
+  .dpad-btn {
+    width:80px; height:80px;
+    background: linear-gradient(145deg, #0d1f2d, #060e14);
+    border: 1px solid var(--border); border-radius:12px;
+    color: var(--text); font-size:1.8rem; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    transition: all 0.1s; -webkit-tap-highlight-color:transparent;
+    touch-action: manipulation;
+  }
+  .dpad-btn.pressed,
+  .dpad-btn:active { background:#0a2030; border-color:var(--cyan); box-shadow:var(--glow-c); color:var(--cyan); }
+  .dpad-btn.blocked { background:#1a0a0a; border-color:var(--red); color:var(--red); pointer-events:none; }
+  .dpad-stop {
+    width:80px; height:80px;
+    background: linear-gradient(145deg, #1a0a0a, #100505);
+    border: 1px solid #3a1020; border-radius:12px;
+    color: var(--red); cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    font-size:0.65rem; letter-spacing:1px; font-weight:bold;
+    transition:all 0.1s; -webkit-tap-highlight-color:transparent;
+    touch-action: manipulation;
+  }
+  .dpad-stop:active { border-color:var(--red); box-shadow:var(--glow-r); }
+
+  .slider-row { display:flex; align-items:center; gap:10px; margin-top:10px; }
+  .slider-label { font-size:0.68rem; color:var(--dim); width:50px; }
+  input[type=range] {
+    flex:1; -webkit-appearance:none; height:4px;
+    background: linear-gradient(to right, var(--cyan) 0%, var(--cyan) var(--val,90%), var(--border) var(--val,90%));
+    border-radius:2px; outline:none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; width:20px; height:20px;
+    background:var(--cyan); border-radius:50%;
+    box-shadow:0 0 8px var(--cyan); cursor:pointer;
+  }
+  .slider-val { font-size:0.8rem; color:var(--cyan); width:30px; text-align:right; }
+
+  .obs-row {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-top:12px; padding:10px 12px;
+    background:#060e14; border:1px solid var(--border); border-radius:8px;
+    font-size:0.7rem;
+  }
+  .tgl { position:relative; width:46px; height:24px; }
+  .tgl input { opacity:0; width:0; height:0; }
+  .tgl-s {
+    position:absolute; inset:0; background:var(--border);
+    border-radius:24px; cursor:pointer; transition:0.3s;
+  }
+  .tgl-s::before {
+    content:''; position:absolute;
+    width:18px; height:18px; left:3px; top:3px;
+    background:var(--dim); border-radius:50%; transition:0.3s;
+  }
+  .tgl input:checked + .tgl-s { background:#003a1a; border:1px solid var(--green); }
+  .tgl input:checked + .tgl-s::before { transform:translateX(22px); background:var(--green); box-shadow:0 0 8px var(--green); }
+
+  .obs-info {
+    margin-top: 8px; padding: 8px 12px;
+    background: #060e14; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 0.62rem; color: var(--dim);
+    line-height: 1.7;
+  }
+
+  /* AUTO */
+  .auto-card {
+    background:#010a14; border:1px solid var(--cyan); border-radius:10px;
+    padding:16px; text-align:center; box-shadow:var(--glow-c); margin-bottom:14px;
+  }
+  .auto-card .big { font-size:1rem; color:var(--cyan); letter-spacing:3px; font-weight:bold; }
+  #auto-state-txt { color:var(--green); font-size:0.8rem; margin-top:8px; }
+  .auto-dist { font-size:0.72rem; color:var(--dim); margin-top:6px; }
+
+  /* FOLLOW */
+  .radar {
+    width:180px; height:90px; border:2px solid var(--orange); border-bottom:none;
+    border-radius:180px 180px 0 0; margin:16px auto 10px;
+    position:relative; overflow:hidden; box-shadow:0 0 20px rgba(255,109,0,0.2);
+  }
+  .radar::before {
+    content:''; position:absolute; width:100%; height:100%;
+    background:conic-gradient(from 180deg at 50% 100%, rgba(255,109,0,0.4) 0deg, transparent 60deg, transparent 360deg);
+    animation:rsweep 2s linear infinite; transform-origin:bottom center;
+  }
+  @keyframes rsweep { 0%{transform:rotate(0deg)} 100%{transform:rotate(-360deg)} }
+  .follow-dist { text-align:center; font-size:1.6rem; color:var(--orange); text-shadow:0 0 12px var(--orange); margin:8px 0; font-weight:bold; }
+  .zones { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; font-size:0.68rem; margin-top:8px; }
+  .zone { padding:4px 10px; border-radius:20px; border:1px solid var(--border); color:var(--dim); transition:all 0.2s; }
+  .zone.az { border-color:var(--orange); color:var(--orange); box-shadow:0 0 10px rgba(255,109,0,0.4); }
+
+  .big-btn {
+    width:100%; padding:14px; border-radius:10px; border:1px solid;
+    background:transparent; font-size:0.78rem; letter-spacing:2px;
+    cursor:pointer; transition:all 0.2s; margin-top:10px;
+    font-family:'Courier New',monospace; font-weight:bold;
+    -webkit-tap-highlight-color:transparent;
+  }
+  .big-btn.c { border-color:var(--cyan); color:var(--cyan); }
+  .big-btn.c:active { background:rgba(0,229,255,0.15); box-shadow:var(--glow-c); }
+  .big-btn.o { border-color:var(--orange); color:var(--orange); }
+  .big-btn.o:active { background:rgba(255,109,0,0.15); }
+  .big-btn.on { background:rgba(0,229,255,0.12); }
+
+  .footer { text-align:center; font-size:0.58rem; color:var(--dim); padding:18px 0 8px; letter-spacing:2px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <h1>ROBO<span style="color:#00ff88">CAR</span></h1>
+    <div class="subtitle">ESP32 CONTROL SYSTEM v3.0</div>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-item"><div class="dot on"></div><span>WIFI OK</span></div>
+    <div class="status-item">&#128225; <span id="dist-display">-- cm</span></div>
+    <div class="status-item"><span id="mode-label" style="color:var(--green)">MANUAL</span></div>
+  </div>
+
+  <!-- 3 tabs, no voice -->
+  <div class="mode-tabs">
+    <div class="mode-tab active-manual" id="tab-manual" onclick="switchMode('manual')">
+      <span class="ti">&#128579;</span>MANUAL
+    </div>
+    <div class="mode-tab" id="tab-auto" onclick="switchMode('auto')">
+      <span class="ti">&#129302;</span>AUTO
+    </div>
+    <div class="mode-tab" id="tab-follow" onclick="switchMode('follow')">
+      <span class="ti">&#128065;</span>FOLLOW
+    </div>
+  </div>
+
+  <!-- MANUAL PANEL -->
+  <div class="panel visible" id="panel-manual">
+    <div class="panel-title">-- MANUAL CONTROL --</div>
+
+    <!-- Evade alert banner (shows during auto-evade) -->
+    <div class="evade-banner" id="evade-banner">
+      &#9888; OBSTACLE! AUTO-EVADING...
+    </div>
+
+    <div class="dpad-wrap">
+      <div class="dpad-row">
+        <div class="dpad-btn" id="btn-f"
+          onmousedown="hold('f',1)" onmouseup="hold('f',0)" onmouseleave="hold('f',0)"
+          ontouchstart="hold('f',1);event.preventDefault()" ontouchend="hold('f',0)">&#9650;</div>
+      </div>
+      <div class="dpad-row">
+        <div class="dpad-btn" id="btn-l"
+          onmousedown="hold('l',1)" onmouseup="hold('l',0)" onmouseleave="hold('l',0)"
+          ontouchstart="hold('l',1);event.preventDefault()" ontouchend="hold('l',0)">&#9664;</div>
+        <div class="dpad-stop"
+          onmousedown="stopCar()" ontouchstart="stopCar();event.preventDefault()">STOP</div>
+        <div class="dpad-btn" id="btn-r"
+          onmousedown="hold('r',1)" onmouseup="hold('r',0)" onmouseleave="hold('r',0)"
+          ontouchstart="hold('r',1);event.preventDefault()" ontouchend="hold('r',0)">&#9654;</div>
+      </div>
+      <div class="dpad-row">
+        <div class="dpad-btn" id="btn-b"
+          onmousedown="hold('b',1)" onmouseup="hold('b',0)" onmouseleave="hold('b',0)"
+          ontouchstart="hold('b',1);event.preventDefault()" ontouchend="hold('b',0)">&#9660;</div>
+      </div>
+    </div>
+
+    <div class="slider-row">
+      <span class="slider-label">SPEED</span>
+      <input type="range" id="spd" min="100" max="255" value="230"
+        oninput="updateSpeed(this.value)" style="--val:90%">
+      <span class="slider-val" id="spd-val">230</span>
+    </div>
+
+    <div class="obs-row">
+      <span>&#9888;&nbsp; OBSTACLE GUARD</span>
+      <label class="tgl">
+        <input type="checkbox" id="obs-tgl" onchange="setObs(this.checked)">
+        <span class="tgl-s"></span>
+      </label>
+    </div>
+
+    <div class="obs-info">
+      When ON: if obstacle detected while moving forward,<br>
+      car auto-reverses + turns randomly, then stops.<br>
+      You resume control with the buttons.
+    </div>
+  </div>
+
+  <!-- AUTO PANEL -->
+  <div class="panel" id="panel-auto">
+    <div class="panel-title">-- OBSTACLE AVOID MODE --</div>
+    <div class="auto-card">
+      <div class="big">AUTO NAVIGATE</div>
+      <div id="auto-state-txt">STANDBY</div>
+      <div class="auto-dist">SENSOR: <span id="auto-dist-txt">-- cm</span></div>
+    </div>
+    <button class="big-btn c" id="auto-btn" onclick="toggleAuto()">&#9654; START AUTO MODE</button>
+  </div>
+
+  <!-- FOLLOW PANEL -->
+  <div class="panel" id="panel-follow">
+    <div class="panel-title">-- FOLLOW MODE --</div>
+    <div class="radar"></div>
+    <div class="follow-dist" id="fdist">-- cm</div>
+    <div class="zones">
+      <div class="zone" id="z-back">&#9664; TOO CLOSE</div>
+      <div class="zone" id="z-hold">&#9632; HOLD</div>
+      <div class="zone" id="z-fwd">FOLLOW &#9654;</div>
+      <div class="zone" id="z-lost">LOST</div>
+    </div>
+    <button class="big-btn o" id="follow-btn" onclick="toggleFollow()">&#9654; START FOLLOW MODE</button>
+  </div>
+
+  <div class="footer">ESP32 &middot; L298N &middot; HC-SR04 &middot; WIFI AP</div>
+</div>
+
+<script>
+var curMode  = 'manual';
+var autoOn   = false;
+var followOn = false;
+var distTmr  = null;
+var evading  = false;  // tracks if manual evade is in progress
+
+// ── MODE SWITCH ──
+function switchMode(m) {
+  stopAll();
+  curMode = m;
+  ['manual','auto','follow'].forEach(function(x){
+    document.getElementById('panel-'+x).classList.remove('visible');
+    document.getElementById('tab-'+x).className = 'mode-tab';
+  });
+  document.getElementById('panel-'+m).classList.add('visible');
+  document.getElementById('tab-'+m).className = 'mode-tab active-'+m;
+  document.getElementById('mode-label').textContent = m.toUpperCase();
+  if (m === 'auto' || m === 'follow') startDist();
+  else stopDist();
+}
+
+function stopAll() {
+  if (autoOn)   { autoOn=false;   fetch('/mode?auto=0'); updAutoBtn(); }
+  if (followOn) { followOn=false; fetch('/follow?f=0');  updFollowBtn(); }
+  fetch('/cmd?dir=s&state=1');
+  clearBtns();
+}
+
+function clearBtns() {
+  ['btn-f','btn-b','btn-l','btn-r'].forEach(function(id){
+    var e = document.getElementById(id);
+    if (e) { e.classList.remove('pressed'); e.classList.remove('blocked'); }
+  });
+}
+
+// ── MANUAL ──
+function hold(d, s) {
+  if (curMode !== 'manual') return;
+  if (evading) return;  // ignore input during auto-evade
+  clearBtns();
+  if (s) {
+    var ids = {f:'btn-f', b:'btn-b', l:'btn-l', r:'btn-r'};
+    if (ids[d]) document.getElementById(ids[d]).classList.add('pressed');
+  }
+  fetch('/cmd?dir='+d+'&state='+s);
+}
+
+function stopCar() {
+  if (evading) return;
+  clearBtns();
+  fetch('/cmd?dir=s&state=1');
+}
+
+function updateSpeed(v) {
+  var pct = Math.round((v-100)/155*100);
+  document.getElementById('spd').style.setProperty('--val', pct+'%');
+  document.getElementById('spd-val').textContent = v;
+  fetch('/speed?v='+v);
+}
+
+function setObs(on) {
+  fetch('/manualobs?v='+(on?1:0));
+}
+
+// Poll evade status every 200ms so UI banner updates
+function startEvadePoll() {
+  var tmr = setInterval(function(){
+    fetch('/evadestate').then(function(r){return r.text();}).then(function(s){
+      var st = parseInt(s);
+      if (st === 0) {
+        // evade done
+        clearInterval(tmr);
+        evading = false;
+        document.getElementById('evade-banner').classList.remove('show');
+        document.getElementById('btn-f').classList.remove('blocked');
+        clearBtns();
+      } else {
+        evading = true;
+        document.getElementById('evade-banner').classList.add('show');
+        document.getElementById('btn-f').classList.add('blocked');
+      }
+    }).catch(function(){ clearInterval(tmr); });
+  }, 200);
+}
+
+// Called when ESP32 sends evade started signal via polling
+function checkEvadeStart() {
+  setInterval(function(){
+    if (curMode !== 'manual') return;
+    fetch('/evadestate').then(function(r){return r.text();}).then(function(s){
+      var st = parseInt(s);
+      if (st > 0 && !evading) {
+        evading = true;
+        document.getElementById('evade-banner').classList.add('show');
+        document.getElementById('btn-f').classList.add('blocked');
+        clearBtns();
+        startEvadePoll();
+      }
+    }).catch(function(){});
+  }, 300);
+}
+checkEvadeStart();
+
+// ── AUTO ──
+function toggleAuto() {
+  autoOn = !autoOn;
+  fetch('/mode?auto='+(autoOn?1:0));
+  updAutoBtn();
+  if (autoOn) startDist();
+  else { stopDist(); document.getElementById('auto-state-txt').textContent='STANDBY'; }
+}
+function updAutoBtn() {
+  var b = document.getElementById('auto-btn');
+  if (autoOn) { b.textContent='&#9209; STOP AUTO MODE'; b.classList.add('on'); }
+  else        { b.textContent='&#9654; START AUTO MODE'; b.classList.remove('on'); }
+}
+
+// ── FOLLOW ──
+function toggleFollow() {
+  followOn = !followOn;
+  fetch('/follow?f='+(followOn?1:0));
+  updFollowBtn();
+  if (followOn) startDist(); else stopDist();
+}
+function updFollowBtn() {
+  var b = document.getElementById('follow-btn');
+  if (followOn) { b.textContent='&#9209; STOP FOLLOW MODE'; b.classList.add('on'); }
+  else          { b.textContent='&#9654; START FOLLOW MODE'; b.classList.remove('on'); }
+}
+
+// ── DISTANCE POLLING ──
+function startDist() { stopDist(); distTmr = setInterval(pollDist, 400); }
+function stopDist()  { if (distTmr) { clearInterval(distTmr); distTmr = null; } }
+function pollDist() {
+  fetch('/dist').then(function(r){ return r.text(); }).then(function(d){
+    var v = parseFloat(d);
+    var t = (v > 0) ? v.toFixed(1)+' cm' : 'N/A';
+    document.getElementById('dist-display').textContent = t;
+    if (curMode === 'auto') {
+      document.getElementById('auto-dist-txt').textContent = t;
+      document.getElementById('auto-state-txt').textContent = autoOn ? autoZone(v) : 'STANDBY';
+    }
+    if (curMode === 'follow') {
+      document.getElementById('fdist').textContent = t;
+      updZones(v);
+    }
+  }).catch(function(){});
+}
+function autoZone(d) {
+  if (d <= 0)  return 'SENSOR ERROR';
+  if (d < 25)  return '&#9940; OBSTACLE - EVADING';
+  return '&#9989; MOVING FORWARD';
+}
+function updZones(d) {
+  ['z-back','z-hold','z-fwd','z-lost'].forEach(function(z){
+    document.getElementById(z).classList.remove('az');
+  });
+  if (d <= 0 || d > 45) document.getElementById('z-lost').classList.add('az');
+  else if (d < 12)      document.getElementById('z-back').classList.add('az');
+  else if (d <= 20)     document.getElementById('z-hold').classList.add('az');
+  else                  document.getElementById('z-fwd').classList.add('az');
+}
+</script>
+</body>
+</html>)=====";
+
+// ================= Motor Helpers =================
+void setMotorSpeed(uint8_t l, uint8_t r){
+  ledcWrite(CH_A, l);
+  ledcWrite(CH_B, r);
+}
+
+void driveStop(){
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+  setMotorSpeed(0, 0);
+}
+
+// Motor A forward, Motor B forward → car moves forward
+void driveForward(uint8_t s){
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  setMotorSpeed(s, s);
+}
+
+// Motor A backward, Motor B backward → car moves backward
+void driveBackward(uint8_t s){
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setMotorSpeed(s, s);
+}
+
+// Motor A backward, Motor B forward → car turns left
+void driveLeft(uint8_t s){
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  setMotorSpeed(s, s);
+}
+
+// Motor A forward, Motor B backward → car turns right
+void driveRight(uint8_t s){
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  setMotorSpeed(s, s);
+}
+
+// ================= Ultrasonic =================
+float getDistanceCm(){
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long d = pulseIn(ECHO_PIN, HIGH, 30000);
+  if(d == 0) return -1;
+  return d * 0.0343 / 2.0;
+}
+
+// ================= Manual Evade (non-blocking) =================
+// Called every loop() when manual mode is active and evade guard is ON.
+// State machine: NONE → BACKWARD → TURN → DONE → NONE
+void handleManualEvade(){
+  unsigned long now = millis();
+
+  switch(mevadeState){
+
+    case MEVADE_NONE:
+      // Check if forward is pressed and obstacle is close
+      if(forwardCmd && manualObstacleGuard){
+        float d = getDistanceCm();
+        if(d > 0 && d < OBSTACLE_DIST_CM){
+          // Obstacle detected! Start evade sequence
+          forwardCmd = false;          // cancel forward command
+          driveBackward(autoSpeed);
+          mevadeState  = MEVADE_BACKWARD;
+          mevadeStart  = now;
+          // Random turn direction using millis as seed
+          mevadeTurnLeft = ((millis() % 2) == 0);
+          Serial.println("EVADE: obstacle detected, reversing...");
+        }
+      }
+      break;
+
+    case MEVADE_BACKWARD:
+      driveBackward(autoSpeed);
+      if(now - mevadeStart >= MEVADE_BACK_TIME){
+        // Switch to turn
+        mevadeState = MEVADE_TURN;
+        mevadeStart = now;
+        Serial.print("EVADE: turning ");
+        Serial.println(mevadeTurnLeft ? "LEFT" : "RIGHT");
+      }
+      break;
+
+    case MEVADE_TURN:
+      if(mevadeTurnLeft) driveLeft(autoSpeed);
+      else               driveRight(autoSpeed);
+      if(now - mevadeStart >= MEVADE_TURN_TIME){
+        // Done — stop and hand back control
+        driveStop();
+        mevadeState = MEVADE_DONE;
+        Serial.println("EVADE: done, control returned to manual");
+      }
+      break;
+
+    case MEVADE_DONE:
+      // Stay stopped, reset state so next loop is clean
+      mevadeState = MEVADE_NONE;
+      break;
+  }
+}
+
+// ================= Manual (normal) =================
+void handleManual(){
+  // If evade is in progress, let handleManualEvade run instead
+  if(mevadeState != MEVADE_NONE){
+    handleManualEvade();
+    return;
+  }
+
+  // Normal manual driving
+  if(forwardCmd){
+    // Pre-check obstacle guard before moving forward
+    if(manualObstacleGuard){
+      float d = getDistanceCm();
+      if(d > 0 && d < OBSTACLE_DIST_CM){
+        // Trigger evade immediately
+        forwardCmd  = false;
+        driveBackward(autoSpeed);
+        mevadeState = MEVADE_BACKWARD;
+        mevadeStart = millis();
+        mevadeTurnLeft = ((millis() % 2) == 0);
+        Serial.println("EVADE: triggered from handleManual");
+        return;
+      }
+    }
+    driveForward(manualSpeed);
+  }
+  else if(backCmd)  driveBackward(manualSpeed);
+  else if(leftCmd)  driveLeft(manualSpeed);
+  else if(rightCmd) driveRight(manualSpeed);
+  else              driveStop();
+}
+
+// ================= Auto Obstacle =================
+void handleObstacle(){
+  unsigned long now = millis();
+  switch(autoState){
+    case AUTO_IDLE:
+      autoState = AUTO_FORWARD;
+      break;
+    case AUTO_FORWARD:{
+      float d = getDistanceCm();
+      if(d > 0 && d < OBSTACLE_DIST_CM){
+        driveStop();
+        autoState     = AUTO_BACKWARD;
+        autoStateStart = now;
+      } else driveForward(autoSpeed);
+    }break;
+    case AUTO_BACKWARD:
+      if(now - autoStateStart >= BACK_TIME){
+        autoState     = AUTO_TURN;
+        autoStateStart = now;
+      } else driveBackward(autoSpeed);
+      break;
+    case AUTO_TURN:
+      if(turnLeftNext) driveLeft(autoSpeed); else driveRight(autoSpeed);
+      if(now - autoStateStart >= TURN_TIME){
+        driveStop();
+        turnLeftNext = !turnLeftNext;
+        autoState    = AUTO_FORWARD;
+      }
+      break;
+  }
+}
+
+// ================= Follow =================
+void handleFollow(){
+  float d = getDistanceCm();
+  if(d < 0)        { driveStop(); return; }
+  if(d < 12)         driveBackward(autoSpeed);
+  else if(d <= 20)   driveStop();
+  else if(d <= 45)   driveForward(autoSpeed);
+  else               driveStop();
+}
+
+// ================= HTTP Handlers =================
+void handleRoot()    { server.send_P(200, "text/html", index_html); }
+
+void handleCmd(){
+  // Block commands during obstacle mode, follow mode, or manual evade
+  if(obstacleMode || followMode || mevadeState != MEVADE_NONE){
+    server.send(200, "text/plain", "IGNORED");
+    return;
+  }
+  String d = server.arg("dir");
+  bool   p = server.arg("state").toInt();
+  if     (d=="f") forwardCmd = p;
+  else if(d=="b") backCmd    = p;
+  else if(d=="l") leftCmd    = p;
+  else if(d=="r") rightCmd   = p;
+  else if(d=="s"){ forwardCmd=backCmd=leftCmd=rightCmd=false; driveStop(); }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleMode(){
+  obstacleMode  = server.arg("auto").toInt();
+  followMode    = false;
+  autoState     = AUTO_FORWARD;
+  mevadeState   = MEVADE_NONE;
+  forwardCmd=backCmd=leftCmd=rightCmd=false;
+  driveStop();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleFollowHttp(){
+  followMode   = server.arg("f").toInt();
+  obstacleMode = false;
+  mevadeState  = MEVADE_NONE;
+  forwardCmd=backCmd=leftCmd=rightCmd=false;
+  driveStop();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSpeed(){
+  int v = server.arg("v").toInt();
+  if(v >= 100 && v <= 255) manualSpeed = (uint8_t)v;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleManualObs(){
+  manualObstacleGuard = server.arg("v").toInt();
+  // Reset evade state when toggled off
+  if(!manualObstacleGuard) mevadeState = MEVADE_NONE;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleDist(){
+  float d = getDistanceCm();
+  server.send(200, "text/plain", String(d, 1));
+}
+
+// Returns current manual evade state (0 = idle, 1 = evading)
+// The UI polls this every 300ms to show/hide the evade banner
+void handleEvadeState(){
+  int s = (mevadeState != MEVADE_NONE && mevadeState != MEVADE_DONE) ? 1 : 0;
+  server.send(200, "text/plain", String(s));
+}
+
+// ================= SETUP =================
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  ledcSetup(CH_A, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA_PIN, CH_A);
+  ledcSetup(CH_B, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENB_PIN, CH_B);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Seed random using floating ADC pin for better randomness
+  randomSeed(analogRead(34));
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSsid, apPassword);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/",           handleRoot);
+  server.on("/cmd",        handleCmd);
+  server.on("/mode",       handleMode);
+  server.on("/follow",     handleFollowHttp);
+  server.on("/speed",      handleSpeed);
+  server.on("/manualobs",  handleManualObs);
+  server.on("/dist",       handleDist);
+  server.on("/evadestate", handleEvadeState);
+  server.begin();
+  Serial.println("Server started");
+}
+
+// ================= LOOP =================
+void loop(){
+  server.handleClient();
+
+  if(followMode)        handleFollow();
+  else if(obstacleMode) handleObstacle();
+  else                  handleManual();   // includes evade logic
+
+  delay(5);
+}
